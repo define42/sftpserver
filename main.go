@@ -19,6 +19,8 @@ import (
 type UserInfo struct {
 	Password string
 	Root     string // jail root on disk, e.g. /srv/sftp/alice
+	CanRead  bool   // allow read/download/list operations
+	CanWrite bool   // allow write/upload/delete/rename operations
 }
 
 // Server is a self-contained SFTP server.
@@ -49,6 +51,8 @@ func (s *Server) ListenAndServe() error {
 				Extensions: map[string]string{
 					"jailRoot": u.Root,
 					"user":     c.User(),
+					"canRead":  fmt.Sprintf("%v", u.CanRead),
+					"canWrite": fmt.Sprintf("%v", u.CanWrite),
 				},
 			}, nil
 		},
@@ -72,10 +76,11 @@ func (s *Server) ListenAndServe() error {
 }
 
 func main() {
-	// Example user DB (replace with your auth source)
+	// Example user DB (replace with your auth source).
+	// WARNING: never hardcode credentials in production; use env vars or a secret store.
 	users := map[string]UserInfo{
-		"alice": {Password: "alicepw", Root: "/srv/sftp/alice"},
-		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob"},
+		"alice": {Password: "alicepw", Root: "/srv/sftp/alice", CanRead: true, CanWrite: true},
+		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob", CanRead: true, CanWrite: false},
 	}
 
 	srv := NewServer(":2022", users, mustHostKey())
@@ -94,6 +99,8 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]
 	user := sshConn.Permissions.Extensions["user"]
+	canRead := sshConn.Permissions.Extensions["canRead"] == "true"
+	canWrite := sshConn.Permissions.Extensions["canWrite"] == "true"
 	log.Printf("login user=%s root=%s from=%s", user, jailRoot, sshConn.RemoteAddr())
 
 	// Discard global requests
@@ -111,11 +118,11 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot)
+		go handleSession(ch, inReqs, jailRoot, canRead, canWrite)
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool) {
 	defer ch.Close()
 
 	for req := range inReqs {
@@ -128,7 +135,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string) 
 			}
 			_ = req.Reply(true, nil)
 
-			handlers := jailedHandlers(jailRoot)
+			handlers := jailedHandlers(jailRoot, canRead, canWrite)
 
 			server := sftp.NewRequestServer(ch, handlers)
 			if err := server.Serve(); err == io.EOF {
@@ -148,7 +155,9 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string) 
 }
 
 type jail struct {
-	root string
+	root     string
+	canRead  bool
+	canWrite bool
 }
 
 // resolve maps an SFTP path (possibly relative) into an absolute on-disk path
@@ -206,6 +215,9 @@ func withinRoot(path, root string) bool {
 // jail implements the four sftp handler interfaces for a chrooted filesystem.
 // Fileread implements sftp.FileReader.
 func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	if !j.canRead {
+		return nil, os.ErrPermission
+	}
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
 		return nil, err
@@ -215,6 +227,9 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 
 // Filewrite implements sftp.FileWriter.
 func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if !j.canWrite {
+		return nil, os.ErrPermission
+	}
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
 		return nil, err
@@ -225,6 +240,9 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 // Filecmd implements sftp.FileCmder.
 func (j jail) Filecmd(r *sftp.Request) error {
+	if !j.canWrite {
+		return os.ErrPermission
+	}
 	switch r.Method {
 	case "Setstat", "Fsetstat":
 		p, err := j.resolve(r.Filepath)
@@ -278,6 +296,9 @@ func (j jail) Filecmd(r *sftp.Request) error {
 
 // Filelist implements sftp.FileLister.
 func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	if !j.canRead {
+		return nil, os.ErrPermission
+	}
 	p, err := j.resolve(r.Filepath)
 	if err != nil {
 		return nil, err
@@ -306,8 +327,8 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
-func jailedHandlers(root string) sftp.Handlers {
-	j := jail{root: filepath.Clean(root)}
+func jailedHandlers(root string, canRead, canWrite bool) sftp.Handlers {
+	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite}
 	return sftp.Handlers{
 		FileGet:  j,
 		FilePut:  j,
