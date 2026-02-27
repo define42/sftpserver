@@ -15,43 +15,51 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-type userInfo struct {
+// UserInfo holds the credentials and jail root for a single SFTP user.
+type UserInfo struct {
 	Password string
 	Root     string // jail root on disk, e.g. /srv/sftp/alice
 }
 
-func main() {
-	// Example user DB (replace with your auth source)
-	users := map[string]userInfo{
-		"alice": {Password: "alicepw", Root: "/srv/sftp/alice"},
-		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob"},
-	}
+// Server is a self-contained SFTP server.
+type Server struct {
+	// Addr is the TCP address to listen on, e.g. ":2022".
+	Addr string
+	// Users maps usernames to their credentials and jail roots.
+	Users map[string]UserInfo
+	// Signer is the host key used for the SSH handshake.
+	Signer ssh.Signer
+}
 
-	hostSigner := mustHostKey()
+// NewServer creates a new Server with the given address, user map, and host key.
+func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Server {
+	return &Server{Addr: addr, Users: users, Signer: signer}
+}
 
+// ListenAndServe starts the SFTP server and blocks, accepting connections.
+// It returns a non-nil error only if the listener cannot be created.
+func (s *Server) ListenAndServe() error {
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			u, ok := users[c.User()]
+			u, ok := s.Users[c.User()]
 			if !ok || u.Password != string(pass) {
 				return nil, fmt.Errorf("invalid credentials")
 			}
-			// Put the jail root into Extensions so we can fetch it later per-conn.
-			perms := &ssh.Permissions{
+			return &ssh.Permissions{
 				Extensions: map[string]string{
 					"jailRoot": u.Root,
 					"user":     c.User(),
 				},
-			}
-			return perms, nil
+			}, nil
 		},
 	}
-	cfg.AddHostKey(hostSigner)
+	cfg.AddHostKey(s.Signer)
 
-	ln, err := net.Listen("tcp", ":2022")
+	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	log.Println("SFTP listening on :2022")
+	log.Printf("SFTP listening on %s", s.Addr)
 
 	for {
 		nc, err := ln.Accept()
@@ -61,6 +69,17 @@ func main() {
 		}
 		go handleConn(nc, cfg)
 	}
+}
+
+func main() {
+	// Example user DB (replace with your auth source)
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: "/srv/sftp/alice"},
+		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob"},
+	}
+
+	srv := NewServer(":2022", users, mustHostKey())
+	log.Fatal(srv.ListenAndServe())
 }
 
 func handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
@@ -184,105 +203,116 @@ func withinRoot(path, root string) bool {
 	return strings.HasPrefix(path, root)
 }
 
+// jail implements the four sftp handler interfaces for a chrooted filesystem.
+// Fileread implements sftp.FileReader.
+func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
+	p, err := j.resolve(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(p)
+}
+
+// Filewrite implements sftp.FileWriter.
+func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	p, err := j.resolve(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	// Create/overwrite
+	return os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+}
+
+// Filecmd implements sftp.FileCmder.
+func (j jail) Filecmd(r *sftp.Request) error {
+	switch r.Method {
+	case "Setstat", "Fsetstat":
+		p, err := j.resolve(r.Filepath)
+		if err != nil {
+			return err
+		}
+		// Minimal: allow chmod/chown/times only if you want; here we ignore.
+		_ = p
+		return nil
+
+	case "Rename":
+		oldP, err := j.resolve(r.Filepath)
+		if err != nil {
+			return err
+		}
+		newP, err := j.resolve(r.Target)
+		if err != nil {
+			return err
+		}
+		return os.Rename(oldP, newP)
+
+	case "Rmdir":
+		p, err := j.resolve(r.Filepath)
+		if err != nil {
+			return err
+		}
+		return os.Remove(p)
+
+	case "Remove":
+		p, err := j.resolve(r.Filepath)
+		if err != nil {
+			return err
+		}
+		return os.Remove(p)
+
+	case "Mkdir":
+		p, err := j.resolve(r.Filepath)
+		if err != nil {
+			return err
+		}
+		return os.MkdirAll(p, 0750)
+
+	case "Symlink":
+		// Strongly consider disallowing symlinks entirely in a jailed server:
+		return os.ErrPermission
+
+	default:
+		return fmt.Errorf("unsupported method: %s", r.Method)
+	}
+}
+
+// Filelist implements sftp.FileLister.
+func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	p, err := j.resolve(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	switch r.Method {
+	case "List":
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			return nil, err
+		}
+		return listerFromDirEntries(p, entries), nil
+	case "Stat":
+		st, err := os.Stat(p)
+		if err != nil {
+			return nil, err
+		}
+		return listerFromFileInfo([]os.FileInfo{st}), nil
+	case "Lstat":
+		st, err := os.Lstat(p)
+		if err != nil {
+			return nil, err
+		}
+		return listerFromFileInfo([]os.FileInfo{st}), nil
+	default:
+		return nil, fmt.Errorf("unsupported list method: %s", r.Method)
+	}
+}
+
 func jailedHandlers(root string) sftp.Handlers {
 	j := jail{root: filepath.Clean(root)}
-
-	// You can tighten this further (disallow symlinks entirely, restrict rename, etc.)
 	return sftp.Handlers{
-		FileGet: sftp.FileReaderFunc(func(r *sftp.Request) (io.ReaderAt, error) {
-			p, err := j.resolve(r.Filepath)
-			if err != nil {
-				return nil, err
-			}
-			return os.Open(p)
-		}),
-		FilePut: sftp.FileWriterFunc(func(r *sftp.Request) (io.WriterAt, error) {
-			p, err := j.resolve(r.Filepath)
-			if err != nil {
-				return nil, err
-			}
-			// Create/overwrite
-			return os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
-		}),
-		FileCmd: sftp.FileCmderFunc(func(r *sftp.Request) error {
-			switch r.Method {
-			case "Setstat", "Fsetstat":
-				p, err := j.resolve(r.Filepath)
-				if err != nil {
-					return err
-				}
-				// Minimal: allow chmod/chown/times only if you want; here we ignore.
-				_ = p
-				return nil
-
-			case "Rename":
-				oldP, err := j.resolve(r.Filepath)
-				if err != nil {
-					return err
-				}
-				newP, err := j.resolve(r.Target)
-				if err != nil {
-					return err
-				}
-				return os.Rename(oldP, newP)
-
-			case "Rmdir":
-				p, err := j.resolve(r.Filepath)
-				if err != nil {
-					return err
-				}
-				return os.Remove(p)
-
-			case "Remove":
-				p, err := j.resolve(r.Filepath)
-				if err != nil {
-					return err
-				}
-				return os.Remove(p)
-
-			case "Mkdir":
-				p, err := j.resolve(r.Filepath)
-				if err != nil {
-					return err
-				}
-				return os.MkdirAll(p, 0750)
-
-			case "Symlink":
-				// Strongly consider disallowing symlinks entirely in a jailed server:
-				return os.ErrPermission
-
-			default:
-				return fmt.Errorf("unsupported method: %s", r.Method)
-			}
-		}),
-		FileList: sftp.FileListerFunc(func(r *sftp.Request) (sftp.ListerAt, error) {
-			p, err := j.resolve(r.Filepath)
-			if err != nil {
-				return nil, err
-			}
-			switch r.Method {
-			case "List":
-				entries, err := os.ReadDir(p)
-				if err != nil {
-					return nil, err
-				}
-				return listerFromDirEntries(p, entries), nil
-			case "Stat":
-				st, err := os.Stat(p)
-				if err != nil {
-					return nil, err
-				}
-				return listerFromFileInfo([]os.FileInfo{st}), nil
-			case "Lstat":
-				st, err := os.Lstat(p)
-				if err != nil {
-					return nil, err
-				}
-				return listerFromFileInfo([]os.FileInfo{st}), nil
-			default:
-				return nil, fmt.Errorf("unsupported list method: %s", r.Method)
-			}
-		}),
+		FileGet:  j,
+		FilePut:  j,
+		FileCmd:  j,
+		FileList: j,
 	}
 }
 
