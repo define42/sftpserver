@@ -251,6 +251,22 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 	return os.Open(p)
 }
 
+// writeLogger wraps an *os.File and logs the filename when the file is closed,
+// signalling that the upload is complete. The sftp request server calls Close()
+// on the returned io.WriterAt when it detects an io.Closer.
+type writeLogger struct {
+	*os.File
+	filepath string
+}
+
+func (w *writeLogger) Close() error {
+	err := w.File.Close()
+	if err == nil {
+		log.Printf("upload complete: %q", w.filepath)
+	}
+	return err
+}
+
 // Filewrite implements sftp.FileWriter.
 func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if !j.canWrite {
@@ -260,8 +276,13 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("upload: %q", r.Filepath)
 	// Create/overwrite
-	return os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+	if err != nil {
+		return nil, err
+	}
+	return &writeLogger{File: f, filepath: r.Filepath}, nil
 }
 
 // Filecmd implements sftp.FileCmder.
