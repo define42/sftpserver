@@ -33,6 +33,13 @@ func main() {
 	}
 
 	srv := sftpserver.NewServer(":2022", users, signer)
+
+	go func() {
+		for path := range srv.CompletedUploads {
+			log.Printf("completed upload: %q", path)
+		}
+	}()
+
 	log.Fatal(srv.ListenAndServe())
 }
 
