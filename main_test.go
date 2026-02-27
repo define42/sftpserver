@@ -100,7 +100,7 @@ func testSigner(t *testing.T) ssh.Signer {
 
 // startTestServer launches a Server on a random OS-assigned port and returns
 // the address and a cancel function that closes the listener.
-func startTestServer(t *testing.T, users map[string]UserInfo) (addr string, stop func()) {
+func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr string, stop func()) {
 	t.Helper()
 	signer := testSigner(t)
 
@@ -110,12 +110,14 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (addr string, stop
 	}
 	addr = ln.Addr().String()
 
-	srv := NewServer(addr, users, signer)
+	srv = NewServer(addr, users, signer)
 
 	// Build SSH server config the same way ListenAndServe does.
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			srv.mu.RLock()
 			u, ok := srv.Users[c.User()]
+			srv.mu.RUnlock()
 			if !ok || u.Password != string(pass) {
 				return nil, fmt.Errorf("invalid credentials")
 			}
@@ -142,7 +144,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (addr string, stop
 	}()
 
 	stop = func() { ln.Close() }
-	return addr, stop
+	return srv, addr, stop
 }
 
 // dialSFTP connects an sftp.Client to addr using the given credentials.
@@ -175,7 +177,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -217,7 +219,7 @@ func TestSFTPServer_List(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "testuser", "testpw")
@@ -240,7 +242,7 @@ func TestSFTPServer_InvalidCredentials(t *testing.T) {
 	users := map[string]UserInfo{
 		"testuser": {Password: "rightpw", Root: root, CanRead: true, CanWrite: true},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	sshCfg := &ssh.ClientConfig{
@@ -282,7 +284,7 @@ func TestSFTPServer_ReadOnlyUser(t *testing.T) {
 	users := map[string]UserInfo{
 		"reader": {Password: "readpw", Root: root, CanRead: true, CanWrite: false},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "reader", "readpw")
@@ -321,7 +323,7 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 	users := map[string]UserInfo{
 		"writer": {Password: "writepw", Root: root, CanRead: false, CanWrite: true},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "writer", "writepw")
@@ -349,6 +351,64 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 	}
 }
 
+// TestServer_AddRemoveUser verifies that AddUser and RemoveUser take effect for
+// new login attempts without restarting the server.
+func TestServer_AddRemoveUser(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Before AddUser: connection must fail.
+	sshCfg := &ssh.ClientConfig{
+		User:            "dynamic",
+		Auth:            []ssh.AuthMethod{ssh.Password("dynpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure before AddUser, got nil")
+	}
+
+	// AddUser: now the user should be able to connect.
+	srv.AddUser("dynamic", UserInfo{Password: "dynpw", Root: root, CanRead: true, CanWrite: true})
+	_ = dialSFTP(t, addr, "dynamic", "dynpw")
+
+	// RemoveUser: subsequent logins must fail.
+	srv.RemoveUser("dynamic")
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure after RemoveUser, got nil")
+	}
+}
+
+// TestServer_AddUser_Replace verifies that AddUser replaces an existing user's info.
+func TestServer_AddUser_Replace(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"user1": {Password: "oldpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Old password works.
+	_ = dialSFTP(t, addr, "user1", "oldpw")
+
+	// Replace with new password.
+	srv.AddUser("user1", UserInfo{Password: "newpw", Root: root, CanRead: true, CanWrite: true})
+
+	// Old password must now fail.
+	sshCfg := &ssh.ClientConfig{
+		User:            "user1",
+		Auth:            []ssh.AuthMethod{ssh.Password("oldpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected old password to fail after AddUser replace, got nil")
+	}
+
+	// New password must work.
+	_ = dialSFTP(t, addr, "user1", "newpw")
+}
+
 // TestSFTPServer_JailedWorkingDirectory verifies that a user's working directory
 // appears as "/" even though it is backed by a subdirectory on disk.
 // This is the jail/chroot behaviour: Alice logs in and sees "/" as her root,
@@ -362,7 +422,7 @@ func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
 	users := map[string]UserInfo{
 		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
 	}
-	addr, stop := startTestServer(t, users)
+	_, addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
 
 	client := dialSFTP(t, addr, "alice", "alicepw")
