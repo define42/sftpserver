@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -409,6 +413,166 @@ func TestServer_AddUser_Replace(t *testing.T) {
 	_ = dialSFTP(t, addr, "user1", "newpw")
 }
 
+// TestNewSignerFromFile verifies that NewSignerFromFile loads a valid PEM key file
+// and returns a usable signer, and that it returns an error for invalid inputs.
+func TestNewSignerFromFile(t *testing.T) {
+	t.Run("RSA key file", func(t *testing.T) {
+		dir := t.TempDir()
+		keyPath := filepath.Join(dir, "id_rsa")
+
+		// Generate an RSA key and write it as PEM.
+		priv, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der := x509.MarshalPKCS1PrivateKey(priv)
+		pemData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
+		if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		signer, err := NewSignerFromFile(keyPath)
+		if err != nil {
+			t.Fatalf("NewSignerFromFile: %v", err)
+		}
+		if signer == nil {
+			t.Fatal("expected non-nil signer")
+		}
+	})
+
+	t.Run("ECDSA key file", func(t *testing.T) {
+		dir := t.TempDir()
+		keyPath := filepath.Join(dir, "id_ecdsa")
+
+		// Generate an ECDSA key and write it as PEM.
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalECPrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pemData := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+		if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		signer, err := NewSignerFromFile(keyPath)
+		if err != nil {
+			t.Fatalf("NewSignerFromFile: %v", err)
+		}
+		if signer == nil {
+			t.Fatal("expected non-nil signer")
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := NewSignerFromFile("/nonexistent/path/to/key.pem")
+		if err == nil {
+			t.Fatal("expected error for missing file, got nil")
+		}
+	})
+
+	t.Run("invalid PEM content", func(t *testing.T) {
+		dir := t.TempDir()
+		keyPath := filepath.Join(dir, "bad.pem")
+		if err := os.WriteFile(keyPath, []byte("not a valid PEM file"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewSignerFromFile(keyPath)
+		if err == nil {
+			t.Fatal("expected error for invalid PEM, got nil")
+		}
+	})
+}
+
+// TestSFTPServer_WithFileHostKey verifies that the server works end-to-end when
+// started with a host key loaded from a file via NewSignerFromFile.
+func TestSFTPServer_WithFileHostKey(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+
+	// Write a PEM-encoded RSA key file.
+	keyPath := filepath.Join(dir, "host_key")
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der := x509.MarshalPKCS1PrivateKey(priv)
+	pemData := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(keyPath, pemData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	signer, err := NewSignerFromFile(keyPath)
+	if err != nil {
+		t.Fatalf("NewSignerFromFile: %v", err)
+	}
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+
+	srv := NewServer(addr, users, signer)
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			srv.mu.RLock()
+			u, ok := srv.Users[c.User()]
+			srv.mu.RUnlock()
+			if !ok || u.Password != string(pass) {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"jailRoot": u.Root,
+					"user":     c.User(),
+					"canRead":  fmt.Sprintf("%v", u.CanRead),
+					"canWrite": fmt.Sprintf("%v", u.CanWrite),
+				},
+			}, nil
+		},
+	}
+	cfg.AddHostKey(srv.Signer)
+
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleConn(nc, cfg)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+	content := []byte("key from file")
+	f, err := client.Create("/hello.txt")
+	if err != nil {
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	f.Close()
+
+	rf, err := client.Open("/hello.txt")
+	if err != nil {
+		t.Fatalf("client.Open: %v", err)
+	}
+	got, _ := io.ReadAll(rf)
+	rf.Close()
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+}
 // TestSFTPServer_JailedWorkingDirectory verifies that a user's working directory
 // appears as "/" even though it is backed by a subdirectory on disk.
 // This is the jail/chroot behaviour: Alice logs in and sees "/" as her root,
