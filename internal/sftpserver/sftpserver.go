@@ -260,6 +260,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("upload: %q", r.Filepath)
 	// Create/overwrite
 	return os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
 }
