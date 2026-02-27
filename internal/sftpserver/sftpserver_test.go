@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -123,7 +124,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 			srv.mu.RLock()
 			u, ok := srv.Users[c.User()]
 			srv.mu.RUnlock()
-			if !ok || u.Password != string(pass) {
+			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return &ssh.Permissions{
@@ -527,7 +528,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			srv.mu.RLock()
 			u, ok := srv.Users[c.User()]
 			srv.mu.RUnlock()
-			if !ok || u.Password != string(pass) {
+			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return &ssh.Permissions{
@@ -658,5 +659,57 @@ func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for CompletedUploads signal for %q", name)
 		}
+	}
+}
+
+// TestSFTPServer_MkdirNoParent verifies that creating a directory whose parent
+// does not yet exist returns an error instead of silently creating all
+// intermediate directories (os.Mkdir semantics, not os.MkdirAll).
+func TestSFTPServer_MkdirNoParent(t *testing.T) {
+	root := t.TempDir()
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// "/nonexistent/child" should fail because "/nonexistent" doesn't exist.
+	if err := client.Mkdir("/nonexistent/child"); err == nil {
+		t.Error("expected error when creating directory with missing parent, got nil")
+	}
+}
+
+// TestSFTPServer_UploadFilePermissions verifies that files created via SFTP
+// are owner-readable/writable only (mode 0600), not group-readable.
+func TestSFTPServer_UploadFilePermissions(t *testing.T) {
+	root := t.TempDir()
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	f, err := client.Create("/secret.txt")
+	if err != nil {
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = f.Write([]byte("sensitive")); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	f.Close()
+
+	info, err := os.Stat(filepath.Join(root, "secret.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	// Mask to the permission bits only and verify owner-only access (0600).
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Errorf("file permissions = %04o; want 0600", got)
 	}
 }
