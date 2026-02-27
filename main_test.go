@@ -123,6 +123,8 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (addr string, stop
 				Extensions: map[string]string{
 					"jailRoot": u.Root,
 					"user":     c.User(),
+					"canRead":  fmt.Sprintf("%v", u.CanRead),
+					"canWrite": fmt.Sprintf("%v", u.CanWrite),
 				},
 			}, nil
 		},
@@ -171,7 +173,7 @@ func TestSFTPServer_UploadDownload(t *testing.T) {
 	root := t.TempDir()
 
 	users := map[string]UserInfo{
-		"testuser": {Password: "testpw", Root: root},
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
@@ -213,7 +215,7 @@ func TestSFTPServer_List(t *testing.T) {
 	}
 
 	users := map[string]UserInfo{
-		"testuser": {Password: "testpw", Root: root},
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
@@ -236,7 +238,7 @@ func TestSFTPServer_List(t *testing.T) {
 func TestSFTPServer_InvalidCredentials(t *testing.T) {
 	root := t.TempDir()
 	users := map[string]UserInfo{
-		"testuser": {Password: "rightpw", Root: root},
+		"testuser": {Password: "rightpw", Root: root, CanRead: true, CanWrite: true},
 	}
 	addr, stop := startTestServer(t, users)
 	t.Cleanup(stop)
@@ -254,7 +256,7 @@ func TestSFTPServer_InvalidCredentials(t *testing.T) {
 
 func TestNewServer(t *testing.T) {
 	users := map[string]UserInfo{
-		"alice": {Password: "pw", Root: "/tmp/alice"},
+		"alice": {Password: "pw", Root: "/tmp/alice", CanRead: true, CanWrite: true},
 	}
 	signer := testSigner(t)
 	srv := NewServer(":0", users, signer)
@@ -266,5 +268,83 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.Signer != signer {
 		t.Error("Signer not set correctly")
+	}
+}
+
+// TestSFTPServer_ReadOnlyUser verifies that a read-only user can download and
+// list files but cannot upload or delete files.
+func TestSFTPServer_ReadOnlyUser(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("read me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"reader": {Password: "readpw", Root: root, CanRead: true, CanWrite: false},
+	}
+	addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "reader", "readpw")
+
+	// Read/list must succeed.
+	entries, err := client.ReadDir("/")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "data.txt" {
+		t.Errorf("ReadDir returned unexpected entries")
+	}
+
+	rf, err := client.Open("/data.txt")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	got, _ := io.ReadAll(rf)
+	rf.Close()
+	if string(got) != "read me" {
+		t.Errorf("downloaded %q; want %q", got, "read me")
+	}
+
+	// Write must be denied.
+	_, err = client.Create("/upload.txt")
+	if err == nil {
+		t.Error("expected write to be denied for read-only user, got nil error")
+	}
+}
+
+// TestSFTPServer_WriteOnlyUser verifies that a write-only user can upload files
+// but cannot read/download or list files.
+func TestSFTPServer_WriteOnlyUser(t *testing.T) {
+	root := t.TempDir()
+
+	users := map[string]UserInfo{
+		"writer": {Password: "writepw", Root: root, CanRead: false, CanWrite: true},
+	}
+	addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "writer", "writepw")
+
+	// Upload must succeed.
+	f, err := client.Create("/upload.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("write only")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Read must be denied.
+	_, err = client.Open("/upload.txt")
+	if err == nil {
+		t.Error("expected read to be denied for write-only user, got nil error")
+	}
+
+	// List must be denied.
+	_, err = client.ReadDir("/")
+	if err == nil {
+		t.Error("expected list to be denied for write-only user, got nil error")
 	}
 }
