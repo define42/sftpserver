@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,21 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+// NewSignerFromFile reads a PEM-encoded private key from the given file path
+// and returns an ssh.Signer suitable for use as a server host key.
+// It supports any key type accepted by ssh.ParsePrivateKey (RSA, ECDSA, Ed25519).
+func NewSignerFromFile(path string) (ssh.Signer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read host key %q: %w", path, err)
+	}
+	signer, err := ssh.ParsePrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse host key %q: %w", path, err)
+	}
+	return signer, nil
+}
 
 // UserInfo holds the credentials and jail root for a single SFTP user.
 type UserInfo struct {
@@ -101,6 +117,9 @@ func (s *Server) ListenAndServe() error {
 }
 
 func main() {
+	hostKeyPath := flag.String("host-key", "", "path to a PEM-encoded private key file to use as the server host key (generated if not provided)")
+	flag.Parse()
+
 	// Example user DB (replace with your auth source).
 	// WARNING: never hardcode credentials in production; use env vars or a secret store.
 	users := map[string]UserInfo{
@@ -108,7 +127,18 @@ func main() {
 		"bob":   {Password: "bobpw", Root: "/srv/sftp/bob", CanRead: true, CanWrite: false},
 	}
 
-	srv := NewServer(":2022", users, mustHostKey())
+	var signer ssh.Signer
+	if *hostKeyPath != "" {
+		var err error
+		signer, err = NewSignerFromFile(*hostKeyPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		signer = mustHostKey()
+	}
+
+	srv := NewServer(":2022", users, signer)
 	log.Fatal(srv.ListenAndServe())
 }
 
