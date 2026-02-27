@@ -1,10 +1,10 @@
-package main
+package sftpserver
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -573,6 +573,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 		t.Errorf("downloaded %q; want %q", got, content)
 	}
 }
+
 // TestSFTPServer_JailedWorkingDirectory verifies that a user's working directory
 // appears as "/" even though it is backed by a subdirectory on disk.
 // This is the jail/chroot behaviour: Alice logs in and sees "/" as her root,
