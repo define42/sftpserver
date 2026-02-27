@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -29,8 +30,30 @@ type Server struct {
 	Addr string
 	// Users maps usernames to their credentials and jail roots.
 	Users map[string]UserInfo
+	// mu protects Users for concurrent reads and writes.
+	mu sync.RWMutex
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
+}
+
+// AddUser adds or replaces a user entry in the server's user map.
+// It is safe to call concurrently with active connections.
+func (s *Server) AddUser(username string, info UserInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Users == nil {
+		s.Users = make(map[string]UserInfo)
+	}
+	s.Users[username] = info
+}
+
+// RemoveUser removes a user entry from the server's user map.
+// Active connections for that user are not terminated.
+// It is safe to call concurrently with active connections.
+func (s *Server) RemoveUser(username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Users, username)
 }
 
 // NewServer creates a new Server with the given address, user map, and host key.
@@ -43,7 +66,9 @@ func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Serve
 func (s *Server) ListenAndServe() error {
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			s.mu.RLock()
 			u, ok := s.Users[c.User()]
+			s.mu.RUnlock()
 			if !ok || u.Password != string(pass) {
 				return nil, fmt.Errorf("invalid credentials")
 			}
