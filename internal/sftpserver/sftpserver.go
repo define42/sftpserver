@@ -47,6 +47,11 @@ type Server struct {
 	mu sync.RWMutex
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
+	// CompletedUploads receives the SFTP path of each file whose write has
+	// finished successfully (i.e. the client closed the file without error).
+	// The channel is buffered; sends are non-blocking so a slow consumer
+	// never stalls an upload.  Callers should drain the channel continuously.
+	CompletedUploads chan string
 }
 
 // AddUser adds or replaces a user entry in the server's user map.
@@ -71,7 +76,12 @@ func (s *Server) RemoveUser(username string) {
 
 // NewServer creates a new Server with the given address, user map, and host key.
 func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Server {
-	return &Server{Addr: addr, Users: users, Signer: signer}
+	return &Server{
+		Addr:             addr,
+		Users:            users,
+		Signer:           signer,
+		CompletedUploads: make(chan string, 64),
+	}
 }
 
 // ListenAndServe starts the SFTP server and blocks, accepting connections.
@@ -109,11 +119,11 @@ func (s *Server) ListenAndServe() error {
 			log.Println("accept:", err)
 			continue
 		}
-		go handleConn(nc, cfg)
+		go handleConn(nc, cfg, s.CompletedUploads)
 	}
 }
 
-func handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
+func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string) {
 	defer nc.Close()
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
@@ -144,11 +154,11 @@ func handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 			continue
 		}
 
-		go handleSession(ch, inReqs, jailRoot, canRead, canWrite)
+		go handleSession(ch, inReqs, jailRoot, canRead, canWrite, uploads)
 	}
 }
 
-func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool) {
+func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, canRead, canWrite bool, uploads chan<- string) {
 	defer ch.Close()
 
 	for req := range inReqs {
@@ -161,7 +171,7 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 			}
 			_ = req.Reply(true, nil)
 
-			handlers := jailedHandlers(jailRoot, canRead, canWrite)
+			handlers := jailedHandlers(jailRoot, canRead, canWrite, uploads)
 
 			server := sftp.NewRequestServer(ch, handlers)
 			if err := server.Serve(); err == io.EOF {
@@ -184,6 +194,7 @@ type jail struct {
 	root     string
 	canRead  bool
 	canWrite bool
+	uploads  chan<- string
 }
 
 // resolve maps an SFTP path (possibly relative) into an absolute on-disk path
@@ -257,12 +268,20 @@ func (j jail) Fileread(r *sftp.Request) (io.ReaderAt, error) {
 type writeLogger struct {
 	*os.File
 	filepath string
+	uploads  chan<- string
 }
 
 func (w *writeLogger) Close() error {
 	err := w.File.Close()
 	if err == nil {
 		log.Printf("upload complete: %q", w.filepath)
+		// Announce the completed upload on the queue; non-blocking so a slow
+		// consumer never stalls the upload handler.
+		select {
+		case w.uploads <- w.filepath:
+		default:
+			log.Printf("upload complete: CompletedUploads queue full, notification for %q dropped", w.filepath)
+		}
 	}
 	return err
 }
@@ -282,7 +301,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &writeLogger{File: f, filepath: r.Filepath}, nil
+	return &writeLogger{File: f, filepath: r.Filepath, uploads: j.uploads}, nil
 }
 
 // Filecmd implements sftp.FileCmder.
@@ -374,8 +393,8 @@ func (j jail) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	}
 }
 
-func jailedHandlers(root string, canRead, canWrite bool) sftp.Handlers {
-	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite}
+func jailedHandlers(root string, canRead, canWrite bool, uploads chan<- string) sftp.Handlers {
+	j := jail{root: filepath.Clean(root), canRead: canRead, canWrite: canWrite, uploads: uploads}
 	return sftp.Handlers{
 		FileGet:  j,
 		FilePut:  j,

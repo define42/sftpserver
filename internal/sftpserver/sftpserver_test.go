@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -143,7 +144,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 			if err != nil {
 				return // listener closed
 			}
-			go handleConn(nc, cfg)
+			go handleConn(nc, cfg, srv.CompletedUploads)
 		}
 	}()
 
@@ -547,7 +548,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(nc, cfg)
+			go handleConn(nc, cfg, srv.CompletedUploads)
 		}
 	}()
 	t.Cleanup(func() { ln.Close() })
@@ -620,5 +621,42 @@ func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
 	_, err = client.ReadDir(root)
 	if err == nil {
 		t.Error("expected error when accessing the real on-disk path via SFTP, got nil")
+	}
+}
+
+// TestSFTPServer_CompletedUploadsQueue verifies that after a file upload finishes
+// the server announces the SFTP path on the CompletedUploads channel.
+func TestSFTPServer_CompletedUploadsQueue(t *testing.T) {
+	root := t.TempDir()
+
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload two files and close each one to trigger the completion signal.
+	for _, name := range []string{"/first.txt", "/second.txt"} {
+		f, err := client.Create(name)
+		if err != nil {
+			t.Fatalf("client.Create(%q): %v", name, err)
+		}
+		if _, err = f.Write([]byte("data")); err != nil {
+			t.Fatalf("f.Write: %v", err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatalf("f.Close: %v", err)
+		}
+
+		select {
+		case got := <-srv.CompletedUploads:
+			if got != name {
+				t.Errorf("CompletedUploads received %q; want %q", got, name)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for CompletedUploads signal for %q", name)
+		}
 	}
 }
