@@ -348,3 +348,52 @@ func TestSFTPServer_WriteOnlyUser(t *testing.T) {
 		t.Error("expected list to be denied for write-only user, got nil error")
 	}
 }
+
+// TestSFTPServer_JailedWorkingDirectory verifies that a user's working directory
+// appears as "/" even though it is backed by a subdirectory on disk.
+// This is the jail/chroot behaviour: Alice logs in and sees "/" as her root,
+// but on disk that "/" is mounted to her actual home directory.
+func TestSFTPServer_JailedWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "alice", "alicepw")
+
+	// The initial working directory must appear as "/" to the client.
+	wd, err := client.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if wd != "/" {
+		t.Errorf("Getwd() = %q; want / (user must see / as their root, not the on-disk path)", wd)
+	}
+
+	// Files in the jail root must be reachable via "/filename", not via the
+	// real on-disk path.
+	entries, err := client.ReadDir("/")
+	if err != nil {
+		t.Fatalf("ReadDir(/): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "file.txt" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("ReadDir(/) = %v; want [file.txt]", names)
+	}
+
+	// The on-disk path must NOT be accessible as an SFTP path; it resolves
+	// to a non-existent location inside the jail.
+	_, err = client.ReadDir(root)
+	if err == nil {
+		t.Error("expected error when accessing the real on-disk path via SFTP, got nil")
+	}
+}
