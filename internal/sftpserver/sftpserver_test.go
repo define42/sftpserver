@@ -1480,6 +1480,77 @@ func TestSFTPServer_DeleteFolderWithFoldersInside(t *testing.T) {
 	}
 }
 
+// TestServer_ListenAndServe_Close verifies that calling Close on a running
+// server causes ListenAndServe to return nil, and that a subsequent connection
+// attempt fails because the listener is closed.
+func TestServer_ListenAndServe_Close(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	signer := testSigner(t)
+
+	srv := NewServer("127.0.0.1:0", users, signer)
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- srv.ListenAndServe()
+	}()
+
+	// Wait until the server is accepting connections.
+	var addr string
+	for i := 0; i < 50; i++ {
+		if a := srv.ListeningAddr(); a != nil {
+			addr = a.String()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == "" {
+		t.Fatal("server did not start in time")
+	}
+
+	// Verify the server is reachable before Close.
+	sshCfg := &ssh.ClientConfig{
+		User:            "testuser",
+		Auth:            []ssh.AuthMethod{ssh.Password("testpw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial before Close: %v", err)
+	}
+	conn.Close()
+
+	// Close the server; ListenAndServe must return nil.
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Errorf("ListenAndServe returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after Close")
+	}
+
+	// Subsequent connection attempts must fail.
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Error("expected error connecting after Close, got nil")
+	}
+}
+
+// TestServer_Close_BeforeListenAndServe verifies that calling Close before
+// ListenAndServe is a safe no-op and does not panic or return an error.
+func TestServer_Close_BeforeListenAndServe(t *testing.T) {
+	srv := NewServer(":0", map[string]UserInfo{}, testSigner(t))
+	if err := srv.Close(); err != nil {
+		t.Errorf("Close before ListenAndServe returned %v; want nil", err)
+	}
+}
+
 // TestSFTPServer_DeleteFolderWithFilesInside verifies that removing a
 // directory that still contains files returns an error.
 func TestSFTPServer_DeleteFolderWithFilesInside(t *testing.T) {
