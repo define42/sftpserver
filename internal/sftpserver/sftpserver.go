@@ -1,6 +1,21 @@
+// Package sftpserver provides an embeddable, security-hardened SFTP server.
+//
+// Core features:
+//
+//   - Per-user jail roots enforced via path resolution and symlink checks.
+//   - Password and SSH public-key authentication with constant-time comparisons.
+//   - Fine-grained CanRead / CanWrite per-user permission flags.
+//   - Runtime user management (AddUser, RemoveUser, AddUserKey, RemoveUserKey).
+//   - Graceful shutdown via Close; upload-completion notifications via CompletedUploads.
+//
+// Typical usage:
+//
+//	srv := sftpserver.NewServer(":2022", users, signer)
+//	log.Fatal(srv.ListenAndServe())
 package sftpserver
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
@@ -236,14 +251,20 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			s.mu.RLock()
 			u, ok := s.Users[c.User()]
 			s.mu.RUnlock()
-			// Always run subtle.ConstantTimeCompare so that the response time
-			// is the same whether the username exists or not, preventing
-			// username enumeration via timing side-channel.
+			// Compare SHA-256 hashes of both passwords so that the comparison
+			// always operates on the same 32-byte length regardless of whether
+			// the username exists or what length the stored password has.  A
+			// direct subtle.ConstantTimeCompare on the raw strings would return
+			// immediately on a length mismatch, leaking username existence via
+			// timing side-channel (non-existent users have an empty stored
+			// password that differs in length from any real password).
 			var storedPw string
 			if ok {
 				storedPw = u.Password
 			}
-			match := subtle.ConstantTimeCompare([]byte(storedPw), pass) == 1
+			storedHash := sha256.Sum256([]byte(storedPw))
+			passHash := sha256.Sum256(pass)
+			match := subtle.ConstantTimeCompare(storedHash[:], passHash[:]) == 1
 			if !ok || !match {
 				return nil, fmt.Errorf("invalid credentials")
 			}
@@ -254,19 +275,28 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			u, ok := s.Users[c.User()]
 			s.mu.RUnlock()
 			keyBytes := key.Marshal()
-			// Always iterate all authorized keys – when the user does not exist,
-			// u is the zero-value UserInfo whose AuthorizedKeys is nil, so the
-			// range is a no-op and the function still takes the same code path.
-			// This ensures the response time does not reveal whether the username
-			// exists (timing side-channel / username enumeration).
-			// Do not return early on the first match: iterate to the end so that
-			// the response time does not leak the position of the matching key.
-			matched := false
+			// Hash the presented key's wire-format bytes to a fixed 32-byte
+			// value so that all comparisons in the loop are the same length
+			// regardless of key algorithm.  RSA, ECDSA, and Ed25519 wire
+			// formats all differ in length; a raw ConstantTimeCompare would
+			// short-circuit on any length mismatch, leaking type information.
+			keyHash := sha256.Sum256(keyBytes)
+			// Perform a dummy fixed-length comparison against an all-zero hash
+			// before the loop.  When the user does not exist (or has no
+			// AuthorizedKeys), the loop is a no-op; without this baseline, such
+			// cases would be measurably faster than users who have keys to check.
+			// The all-zero value will never match a real key's SHA-256 hash.
+			var zeroHash [sha256.Size]byte
+			matched := subtle.ConstantTimeCompare(keyHash[:], zeroHash[:]) == 1 // always false
+			// Do not return early on the first match: iterate to the end so
+			// that the response time does not leak the position of the matching
+			// key in the AuthorizedKeys slice.
 			for _, authorizedKey := range u.AuthorizedKeys {
 				if authorizedKey == nil {
 					continue
 				}
-				if subtle.ConstantTimeCompare(keyBytes, authorizedKey.Marshal()) == 1 {
+				authHash := sha256.Sum256(authorizedKey.Marshal())
+				if subtle.ConstantTimeCompare(keyHash[:], authHash[:]) == 1 {
 					matched = true
 				}
 			}
@@ -520,7 +550,9 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		return os.Mkdir(p, 0750)
 
 	case "Symlink":
-		// Strongly consider disallowing symlinks entirely in a jailed server:
+		// Symlinks are disallowed in the jail: a client-created symlink could
+		// point outside the jail root and be followed by a subsequent request,
+		// bypassing the path-containment checks.
 		return os.ErrPermission
 
 	default:
