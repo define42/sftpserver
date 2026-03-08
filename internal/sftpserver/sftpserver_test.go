@@ -786,3 +786,118 @@ func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
 		t.Fatal("expected authentication error with wrong key, got nil")
 	}
 }
+
+// TestServer_AddUserKey verifies that AddUserKey grants a new key authentication
+// access for an existing user without disturbing the existing password or other
+// fields.
+func TestServer_AddUserKey(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Before AddUserKey: public-key auth must fail (no keys registered).
+	newSigner, newPubKey := testClientKey(t)
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(newSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure before AddUserKey, got nil")
+	}
+
+	// AddUserKey: public-key auth must now succeed.
+	srv.AddUserKey("alice", newPubKey)
+	_ = dialSFTPWithPublicKey(t, addr, "alice", newSigner)
+
+	// Password auth must still work.
+	_ = dialSFTP(t, addr, "alice", "alicepw")
+}
+
+// TestServer_RemoveUserKey verifies that RemoveUserKey revokes a specific key
+// while leaving any other keys (and password auth) intact.
+func TestServer_RemoveUserKey(t *testing.T) {
+	root := t.TempDir()
+	signer1, pubKey1 := testClientKey(t)
+	signer2, pubKey2 := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"bob": {
+			Password:       "bobpw",
+			AuthorizedKeys: []ssh.PublicKey{pubKey1, pubKey2},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Both keys work initially.
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer1)
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer2)
+
+	// Remove key1 only.
+	srv.RemoveUserKey("bob", pubKey1)
+
+	// key1 must now be rejected.
+	sshCfg := &ssh.ClientConfig{
+		User:            "bob",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer1)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure for removed key, got nil")
+	}
+
+	// key2 must still work.
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer2)
+
+	// Password auth must still work.
+	_ = dialSFTP(t, addr, "bob", "bobpw")
+}
+
+// TestServer_AddUserKey_NoDuplicate verifies that AddUserKey does not store the
+// same key more than once when called multiple times with identical keys.
+func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
+	root := t.TempDir()
+	_, pubKey := testClientKey(t)
+
+	srv := NewServer(":0", map[string]UserInfo{
+		"carol": {Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.AddUserKey("carol", pubKey)
+	srv.AddUserKey("carol", pubKey)
+	srv.AddUserKey("carol", pubKey)
+
+	srv.mu.RLock()
+	n := len(srv.Users["carol"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("expected 1 authorized key after duplicate adds, got %d", n)
+	}
+}
+
+// TestServer_AddRemoveUserKey_NonExistentUser verifies that calling AddUserKey
+// or RemoveUserKey for a user that does not exist is a safe no-op.
+func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
+	srv := NewServer(":0", map[string]UserInfo{}, testSigner(t))
+	_, pub := testClientKey(t)
+
+	// Neither call should panic or create phantom entries.
+	srv.AddUserKey("ghost", pub)
+	srv.RemoveUserKey("ghost", pub)
+
+	srv.mu.RLock()
+	_, exists := srv.Users["ghost"]
+	srv.mu.RUnlock()
+
+	if exists {
+		t.Error("AddUserKey created a user entry for a non-existent user")
+	}
+}

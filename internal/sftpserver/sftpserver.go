@@ -76,6 +76,48 @@ func (s *Server) RemoveUser(username string) {
 	delete(s.Users, username)
 }
 
+// AddUserKey appends key to the AuthorizedKeys of an existing user.
+// If the key is already present (by wire-format equality) it is not added again.
+// It is a no-op when username does not exist.
+// It is safe to call concurrently with active connections.
+func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.Users[username]
+	if !ok {
+		return
+	}
+	keyBytes := key.Marshal()
+	for _, existing := range u.AuthorizedKeys {
+		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
+			return // already present
+		}
+	}
+	u.AuthorizedKeys = append(u.AuthorizedKeys, key)
+	s.Users[username] = u
+}
+
+// RemoveUserKey removes key from the AuthorizedKeys of an existing user.
+// It is a no-op when username does not exist or the key is not found.
+// It is safe to call concurrently with active connections.
+func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.Users[username]
+	if !ok {
+		return
+	}
+	keyBytes := key.Marshal()
+	var filtered []ssh.PublicKey
+	for _, existing := range u.AuthorizedKeys {
+		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) != 1 {
+			filtered = append(filtered, existing)
+		}
+	}
+	u.AuthorizedKeys = filtered
+	s.Users[username] = u
+}
+
 // NewServer creates a new Server with the given address, user map, and host key.
 func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Server {
 	return &Server{
