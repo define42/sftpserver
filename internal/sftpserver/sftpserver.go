@@ -1,6 +1,7 @@
 package sftpserver
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
@@ -92,7 +93,7 @@ func (s *Server) ListenAndServe() error {
 			s.mu.RLock()
 			u, ok := s.Users[c.User()]
 			s.mu.RUnlock()
-			if !ok || u.Password != string(pass) {
+			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return &ssh.Permissions{
@@ -297,7 +298,7 @@ func (j jail) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 	}
 	log.Printf("upload: %q", r.Filepath)
 	// Create/overwrite
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0640)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +350,7 @@ func (j jail) Filecmd(r *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		return os.MkdirAll(p, 0750)
+		return os.Mkdir(p, 0750)
 
 	case "Symlink":
 		// Strongly consider disallowing symlinks entirely in a jailed server:
