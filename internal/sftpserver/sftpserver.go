@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -234,7 +235,15 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			s.mu.RLock()
 			u, ok := s.Users[c.User()]
 			s.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
+			// Always run subtle.ConstantTimeCompare so that the response time
+			// is the same whether the username exists or not, preventing
+			// username enumeration via timing side-channel.
+			var storedPw string
+			if ok {
+				storedPw = u.Password
+			}
+			match := subtle.ConstantTimeCompare([]byte(storedPw), pass) == 1
+			if !ok || !match {
 				return nil, fmt.Errorf("invalid credentials")
 			}
 			return permissionsFor(u, c.User()), nil
@@ -265,11 +274,18 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string) {
 	defer nc.Close()
 
+	// Enforce a deadline for the SSH handshake to prevent malicious clients
+	// from holding goroutines open indefinitely without completing the
+	// handshake (denial-of-service via resource exhaustion).
+	_ = nc.SetDeadline(time.Now().Add(30 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
 	if err != nil {
 		log.Println("ssh handshake:", err)
 		return
 	}
+	// Handshake complete – remove the deadline so session I/O is not
+	// artificially limited.
+	_ = nc.SetDeadline(time.Time{})
 	defer sshConn.Close()
 
 	jailRoot := sshConn.Permissions.Extensions["jailRoot"]

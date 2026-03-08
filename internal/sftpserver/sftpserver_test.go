@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -1587,5 +1588,83 @@ func TestSFTPServer_DeleteFolderWithFilesInside(t *testing.T) {
 	}
 	if _, err := client.Stat("/hasfiles/content.txt"); err != nil {
 		t.Fatalf("file /hasfiles/content.txt should still exist after failed removal: %v", err)
+	}
+}
+
+// TestSFTPServer_PasswordAuth_NonExistentUser verifies that authentication
+// with a non-existent username returns an error (the timing side-channel fix
+// must not break the rejection path).
+func TestSFTPServer_PasswordAuth_NonExistentUser(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "nobody",
+		Auth:            []ssh.AuthMethod{ssh.Password("alicepw")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure for non-existent user, got nil")
+	}
+}
+
+// TestHandleConn_HandshakeTimeout verifies that a raw TCP connection that
+// never sends SSH data is dropped well within the 30-second handshake
+// deadline (we use a 35-second upper bound to keep the test fast without
+// being flaky on slow CI).
+func TestHandleConn_HandshakeTimeout(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	signer := testSigner(t)
+	srv := NewServer("127.0.0.1:0", users, signer)
+	cfg := srv.sshServerConfig()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleConn(nc, cfg, srv.CompletedUploads)
+		}
+	}()
+
+	// Connect but never send any SSH data.
+	idle, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	defer idle.Close()
+
+	// The server sends the SSH protocol version banner on connect, so we must
+	// drain bytes until the connection is fully closed by the server-side
+	// handshake deadline.  Use a 35-second outer deadline so the test does not
+	// hang if the fix were ever reverted.
+	_ = idle.SetReadDeadline(time.Now().Add(35 * time.Second))
+	buf := make([]byte, 256)
+	var lastErr error
+	for {
+		_, lastErr = idle.Read(buf)
+		if lastErr != nil {
+			break
+		}
+	}
+	// The deadline on our side must NOT have expired – the server must have
+	// closed the connection first (EOF or connection-reset).
+	var netErr net.Error
+	if errors.As(lastErr, &netErr) && netErr.Timeout() {
+		t.Error("server did not close the idle connection before the 35 s outer deadline; handshake timeout may not be working")
 	}
 }
