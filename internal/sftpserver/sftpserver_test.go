@@ -1343,3 +1343,178 @@ func TestSFTPServer_Chgrp(t *testing.T) {
 		t.Fatalf("Chown (chgrp): %v", err)
 	}
 }
+
+// TestSFTPServer_CreateFolderInFolder verifies that a subdirectory can be
+// created inside an existing parent directory, and that it appears correctly
+// when listing the parent's contents.
+func TestSFTPServer_CreateFolderInFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create the parent directory.
+	if err := client.Mkdir("/parent"); err != nil {
+		t.Fatalf("Mkdir(/parent): %v", err)
+	}
+
+	// Create a child directory inside the parent.
+	if err := client.Mkdir("/parent/child"); err != nil {
+		t.Fatalf("Mkdir(/parent/child): %v", err)
+	}
+
+	// Verify the child appears when listing the parent.
+	entries, err := client.ReadDir("/parent")
+	if err != nil {
+		t.Fatalf("ReadDir(/parent): %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.Name() == "child" && e.IsDir() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("child directory not found in ReadDir(/parent)")
+	}
+}
+
+// TestSFTPServer_DeleteFolder verifies that an empty directory can be removed
+// via SFTP RemoveDirectory and that it disappears from the listing afterwards.
+func TestSFTPServer_DeleteFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create an empty directory.
+	if err := client.Mkdir("/emptydir"); err != nil {
+		t.Fatalf("Mkdir(/emptydir): %v", err)
+	}
+
+	// Remove it.
+	if err := client.RemoveDirectory("/emptydir"); err != nil {
+		t.Fatalf("RemoveDirectory(/emptydir): %v", err)
+	}
+
+	// Verify it is gone.
+	if _, err := client.Stat("/emptydir"); err == nil {
+		t.Error("expected error accessing removed directory, got nil")
+	}
+}
+
+// TestSFTPServer_DeleteFolderInFolder verifies that a nested empty directory
+// can be removed while leaving the parent directory intact.
+func TestSFTPServer_DeleteFolderInFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create parent and nested child directories.
+	if err := client.Mkdir("/outer"); err != nil {
+		t.Fatalf("Mkdir(/outer): %v", err)
+	}
+	if err := client.Mkdir("/outer/inner"); err != nil {
+		t.Fatalf("Mkdir(/outer/inner): %v", err)
+	}
+
+	// Remove the inner (nested) directory.
+	if err := client.RemoveDirectory("/outer/inner"); err != nil {
+		t.Fatalf("RemoveDirectory(/outer/inner): %v", err)
+	}
+
+	// The inner directory must be gone.
+	if _, err := client.Stat("/outer/inner"); err == nil {
+		t.Error("expected error accessing removed nested directory, got nil")
+	}
+
+	// The outer (parent) directory must still exist.
+	if _, err := client.Stat("/outer"); err != nil {
+		t.Fatalf("parent directory /outer should still exist: %v", err)
+	}
+}
+
+// TestSFTPServer_DeleteFolderWithFoldersInside verifies that removing a
+// directory that still contains subdirectories returns an error (the server
+// uses os.Remove semantics which refuses non-empty directories).
+func TestSFTPServer_DeleteFolderWithFoldersInside(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create a parent directory with a subdirectory inside.
+	if err := client.Mkdir("/nonempty"); err != nil {
+		t.Fatalf("Mkdir(/nonempty): %v", err)
+	}
+	if err := client.Mkdir("/nonempty/subdir"); err != nil {
+		t.Fatalf("Mkdir(/nonempty/subdir): %v", err)
+	}
+
+	// Attempt to remove the non-empty parent; must fail.
+	if err := client.RemoveDirectory("/nonempty"); err == nil {
+		t.Error("expected error when removing non-empty directory (contains subdirs), got nil")
+	}
+
+	// Parent must still be present.
+	if _, err := client.Stat("/nonempty"); err != nil {
+		t.Fatalf("non-empty directory /nonempty should still exist after failed removal: %v", err)
+	}
+}
+
+// TestSFTPServer_DeleteFolderWithFilesInside verifies that removing a
+// directory that still contains files returns an error.
+func TestSFTPServer_DeleteFolderWithFilesInside(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create a directory and put a file inside.
+	if err := client.Mkdir("/hasfiles"); err != nil {
+		t.Fatalf("Mkdir(/hasfiles): %v", err)
+	}
+	f, err := client.Create("/hasfiles/content.txt")
+	if err != nil {
+		t.Fatalf("Create(/hasfiles/content.txt): %v", err)
+	}
+	if _, err = f.Write([]byte("data")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Attempt to remove the non-empty directory; must fail.
+	if err := client.RemoveDirectory("/hasfiles"); err == nil {
+		t.Error("expected error when removing non-empty directory (contains files), got nil")
+	}
+
+	// Directory and its contents must still be present.
+	if _, err := client.Stat("/hasfiles"); err != nil {
+		t.Fatalf("directory /hasfiles should still exist after failed removal: %v", err)
+	}
+	if _, err := client.Stat("/hasfiles/content.txt"); err != nil {
+		t.Fatalf("file /hasfiles/content.txt should still exist after failed removal: %v", err)
+	}
+}
