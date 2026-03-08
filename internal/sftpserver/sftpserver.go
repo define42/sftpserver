@@ -78,9 +78,12 @@ func (s *Server) RemoveUser(username string) {
 
 // AddUserKey appends key to the AuthorizedKeys of an existing user.
 // If the key is already present (by wire-format equality) it is not added again.
-// It is a no-op when username does not exist.
+// It is a no-op when username does not exist or key is nil.
 // It is safe to call concurrently with active connections.
 func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
+	if key == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.Users[username]
@@ -89,6 +92,9 @@ func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 	}
 	keyBytes := key.Marshal()
 	for _, existing := range u.AuthorizedKeys {
+		if existing == nil {
+			continue
+		}
 		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
 			return // already present
 		}
@@ -98,9 +104,12 @@ func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
 }
 
 // RemoveUserKey removes key from the AuthorizedKeys of an existing user.
-// It is a no-op when username does not exist or the key is not found.
+// It is a no-op when username does not exist, the key is not found, or key is nil.
 // It is safe to call concurrently with active connections.
 func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
+	if key == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.Users[username]
@@ -110,6 +119,9 @@ func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
 	keyBytes := key.Marshal()
 	var filtered []ssh.PublicKey
 	for _, existing := range u.AuthorizedKeys {
+		if existing == nil {
+			continue
+		}
 		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) != 1 {
 			filtered = append(filtered, existing)
 		}
@@ -192,6 +204,9 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			}
 			keyBytes := key.Marshal()
 			for _, authorizedKey := range u.AuthorizedKeys {
+				if authorizedKey == nil {
+					continue
+				}
 				if subtle.ConstantTimeCompare(keyBytes, authorizedKey.Marshal()) == 1 {
 					return permissionsFor(u, c.User()), nil
 				}

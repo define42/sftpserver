@@ -901,3 +901,96 @@ func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
 		t.Error("AddUserKey created a user entry for a non-existent user")
 	}
 }
+
+// TestServer_NilKeyInAuthorizedKeys verifies that the server does not panic
+// when AuthorizedKeys contains a nil entry. The nil entry must be skipped, and
+// a subsequent valid key in the same slice must still be accepted.
+func TestServer_NilKeyInAuthorizedKeys(t *testing.T) {
+	root := t.TempDir()
+	validSigner, validPubKey := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"dave": {
+			// AuthorizedKeys intentionally contains a nil entry before the
+			// valid key to trigger the panic-prone code path.
+			AuthorizedKeys: []ssh.PublicKey{nil, validPubKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Must not panic; valid key after the nil entry must authenticate.
+	client := dialSFTPWithPublicKey(t, addr, "dave", validSigner)
+	_ = client
+}
+
+// TestServer_AddUserKey_NilKey verifies that passing nil to AddUserKey is a
+// safe no-op and does not panic or corrupt the AuthorizedKeys slice.
+func TestServer_AddUserKey_NilKey(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"eve": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.AddUserKey("eve", nil) // must not panic
+
+	srv.mu.RLock()
+	n := len(srv.Users["eve"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("AddUserKey(nil) changed AuthorizedKeys length to %d; want 1", n)
+	}
+}
+
+// TestServer_RemoveUserKey_NilEntry verifies that RemoveUserKey does not panic
+// when AuthorizedKeys contains nil entries and correctly removes the target key.
+func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"frank": {
+			// Mix nil entries with a real key.
+			AuthorizedKeys: []ssh.PublicKey{nil, pub, nil},
+			Root:           root,
+			CanRead:        true,
+		},
+	}, testSigner(t))
+
+	srv.RemoveUserKey("frank", pub) // must not panic
+
+	srv.mu.RLock()
+	keys := srv.Users["frank"].AuthorizedKeys
+	srv.mu.RUnlock()
+
+	for _, k := range keys {
+		if k == nil {
+			continue
+		}
+		t.Error("RemoveUserKey left the real key in AuthorizedKeys")
+	}
+}
+
+// TestServer_RemoveUserKey_NilKey verifies that passing nil to RemoveUserKey is
+// a safe no-op and does not modify AuthorizedKeys.
+func TestServer_RemoveUserKey_NilKey(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"grace": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.RemoveUserKey("grace", nil) // must not panic
+
+	srv.mu.RLock()
+	n := len(srv.Users["grace"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("RemoveUserKey(nil) changed AuthorizedKeys length to %d; want 1", n)
+	}
+}
