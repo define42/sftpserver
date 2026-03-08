@@ -2,6 +2,7 @@ package sftpserver
 
 import (
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -45,8 +46,10 @@ type Server struct {
 	Addr string
 	// Users maps usernames to their credentials and jail roots.
 	Users map[string]UserInfo
-	// mu protects Users for concurrent reads and writes.
+	// mu protects Users and ln for concurrent reads and writes.
 	mu sync.RWMutex
+	// ln is the active listener; set by ListenAndServe and closed by Close.
+	ln net.Listener
 	// Signer is the host key used for the SSH handshake.
 	Signer ssh.Signer
 	// CompletedUploads receives the SFTP path of each file whose write has
@@ -141,7 +144,9 @@ func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Serve
 }
 
 // ListenAndServe starts the SFTP server and blocks, accepting connections.
-// It returns a non-nil error only if the listener cannot be created.
+// It returns a non-nil error only if the listener cannot be created or fails
+// with an unexpected error.  It returns nil when the server is stopped via
+// Close.
 func (s *Server) ListenAndServe() error {
 	cfg := s.sshServerConfig()
 
@@ -149,16 +154,55 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("SFTP listening on %s", s.Addr)
+
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.ln = nil
+		s.mu.Unlock()
+	}()
+
+	log.Printf("SFTP listening on %s", ln.Addr())
 
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			log.Println("accept:", err)
-			continue
+			return err
 		}
 		go handleConn(nc, cfg, s.CompletedUploads)
 	}
+}
+
+// Close stops the server by closing the listener, causing ListenAndServe to
+// return nil.  It is safe to call concurrently with active connections; in-
+// flight connections are not terminated.  Calling Close before ListenAndServe
+// has been called, or after it has already returned, is a no-op.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return nil
+	}
+	return s.ln.Close()
+}
+
+// ListeningAddr returns the actual network address the server is listening on,
+// or nil if the server is not currently listening.  It is useful when the
+// server was started with port 0 (OS-assigned port).
+func (s *Server) ListeningAddr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.ln == nil {
+		return nil
+	}
+	return s.ln.Addr()
 }
 
 // permissionsFor builds the ssh.Permissions for an authenticated user,
@@ -269,14 +313,10 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 			handlers := jailedHandlers(jailRoot, canRead, canWrite, uploads)
 
 			server := sftp.NewRequestServer(ch, handlers)
-			if err := server.Serve(); err == io.EOF {
-				_ = server.Close()
-				return
-			} else if err != nil {
+			if err := server.Serve(); err != nil && !errors.Is(err, io.EOF) {
 				log.Println("sftp serve:", err)
-				_ = server.Close()
-				return
 			}
+			_ = server.Close()
 			return
 
 		default:
