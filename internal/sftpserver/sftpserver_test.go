@@ -6,10 +6,8 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -117,27 +115,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 	addr = ln.Addr().String()
 
 	srv = NewServer(addr, users, signer)
-
-	// Build SSH server config the same way ListenAndServe does.
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			srv.mu.RLock()
-			u, ok := srv.Users[c.User()]
-			srv.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"jailRoot": u.Root,
-					"user":     c.User(),
-					"canRead":  fmt.Sprintf("%v", u.CanRead),
-					"canWrite": fmt.Sprintf("%v", u.CanWrite),
-				},
-			}, nil
-		},
-	}
-	cfg.AddHostKey(srv.Signer)
+	cfg := srv.sshServerConfig()
 
 	go func() {
 		for {
@@ -523,25 +501,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	addr := ln.Addr().String()
 
 	srv := NewServer(addr, users, signer)
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			srv.mu.RLock()
-			u, ok := srv.Users[c.User()]
-			srv.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"jailRoot": u.Root,
-					"user":     c.User(),
-					"canRead":  fmt.Sprintf("%v", u.CanRead),
-					"canWrite": fmt.Sprintf("%v", u.CanWrite),
-				},
-			}, nil
-		},
-	}
-	cfg.AddHostKey(srv.Signer)
+	cfg := srv.sshServerConfig()
 
 	go func() {
 		for {
@@ -711,5 +671,118 @@ func TestSFTPServer_UploadFilePermissions(t *testing.T) {
 	// Mask to the permission bits only and verify owner-only access (0600).
 	if got := info.Mode().Perm(); got != 0600 {
 		t.Errorf("file permissions = %04o; want 0600", got)
+	}
+}
+
+// testClientKey generates a throwaway RSA key pair for use as a client
+// authentication key in tests.  It returns both the signer (private key) and
+// the corresponding public key.
+func testClientKey(t *testing.T) (ssh.Signer, ssh.PublicKey) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer, signer.PublicKey()
+}
+
+// dialSFTPWithPublicKey connects an sftp.Client to addr using public-key auth.
+func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *sftp.Client {
+	t.Helper()
+	sshCfg := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		conn.Close()
+	})
+	return client
+}
+
+// TestSFTPServer_PublicKeyAuth verifies that a user configured with an
+// AuthorizedKeys entry can authenticate using the matching private key and
+// perform full read/write SFTP operations.
+func TestSFTPServer_PublicKeyAuth(t *testing.T) {
+	root := t.TempDir()
+	clientSigner, clientPubKey := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"keyuser": {
+			AuthorizedKeys: []ssh.PublicKey{clientPubKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTPWithPublicKey(t, addr, "keyuser", clientSigner)
+
+	// Upload a file to verify write access.
+	content := []byte("public key auth test")
+	f, err := client.Create("/pubkey.txt")
+	if err != nil {
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	f.Close()
+
+	// Download and verify the content.
+	rf, err := client.Open("/pubkey.txt")
+	if err != nil {
+		t.Fatalf("client.Open: %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	rf.Close()
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+}
+
+// TestSFTPServer_PublicKeyAuth_InvalidKey verifies that a key not listed in a
+// user's AuthorizedKeys is rejected.
+func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
+	root := t.TempDir()
+	_, authorizedKey := testClientKey(t)
+	wrongSigner, _ := testClientKey(t)
+	users := map[string]UserInfo{
+		"keyuser": {
+			AuthorizedKeys: []ssh.PublicKey{authorizedKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "keyuser",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(wrongSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected authentication error with wrong key, got nil")
 	}
 }
