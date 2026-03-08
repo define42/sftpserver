@@ -2,6 +2,7 @@ package sftpserver
 
 import (
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -252,19 +253,27 @@ func (s *Server) sshServerConfig() *ssh.ServerConfig {
 			s.mu.RLock()
 			u, ok := s.Users[c.User()]
 			s.mu.RUnlock()
-			if !ok {
-				return nil, fmt.Errorf("invalid credentials")
-			}
 			keyBytes := key.Marshal()
+			// Always iterate all authorized keys – when the user does not exist,
+			// u is the zero-value UserInfo whose AuthorizedKeys is nil, so the
+			// range is a no-op and the function still takes the same code path.
+			// This ensures the response time does not reveal whether the username
+			// exists (timing side-channel / username enumeration).
+			// Do not return early on the first match: iterate to the end so that
+			// the response time does not leak the position of the matching key.
+			matched := false
 			for _, authorizedKey := range u.AuthorizedKeys {
 				if authorizedKey == nil {
 					continue
 				}
 				if subtle.ConstantTimeCompare(keyBytes, authorizedKey.Marshal()) == 1 {
-					return permissionsFor(u, c.User()), nil
+					matched = true
 				}
 			}
-			return nil, fmt.Errorf("invalid credentials")
+			if !ok || !matched {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			return permissionsFor(u, c.User()), nil
 		},
 	}
 	cfg.AddHostKey(s.Signer)
@@ -319,8 +328,16 @@ func handleSession(ch ssh.Channel, inReqs <-chan *ssh.Request, jailRoot string, 
 	for req := range inReqs {
 		switch req.Type {
 		case "subsystem":
-			// Payload is: string "sftp"
-			if len(req.Payload) < 4 || string(req.Payload[4:]) != "sftp" {
+			// Payload is a wire-format SSH string: uint32 length + bytes.
+			// Validate that the payload is large enough and that the encoded
+			// length matches the actual remaining bytes before slicing.
+			if len(req.Payload) < 4 {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			nameLen := binary.BigEndian.Uint32(req.Payload[:4])
+			// Use int64 arithmetic to avoid uint32 overflow when checking bounds.
+			if int64(nameLen) > int64(len(req.Payload))-4 || string(req.Payload[4:4+nameLen]) != "sftp" {
 				_ = req.Reply(false, nil)
 				continue
 			}
@@ -576,6 +593,7 @@ func listerFromDirEntries(dir string, entries []os.DirEntry) sftp.ListerAt {
 	for _, e := range entries {
 		fi, err := e.Info()
 		if err != nil {
+			log.Printf("listerFromDirEntries: stat %s/%s: %v", dir, e.Name(), err)
 			continue
 		}
 		infos = append(infos, fi)
