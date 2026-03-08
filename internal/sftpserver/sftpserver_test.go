@@ -6,10 +6,8 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -117,27 +115,7 @@ func startTestServer(t *testing.T, users map[string]UserInfo) (srv *Server, addr
 	addr = ln.Addr().String()
 
 	srv = NewServer(addr, users, signer)
-
-	// Build SSH server config the same way ListenAndServe does.
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			srv.mu.RLock()
-			u, ok := srv.Users[c.User()]
-			srv.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"jailRoot": u.Root,
-					"user":     c.User(),
-					"canRead":  fmt.Sprintf("%v", u.CanRead),
-					"canWrite": fmt.Sprintf("%v", u.CanWrite),
-				},
-			}, nil
-		},
-	}
-	cfg.AddHostKey(srv.Signer)
+	cfg := srv.sshServerConfig()
 
 	go func() {
 		for {
@@ -523,25 +501,7 @@ func TestSFTPServer_WithFileHostKey(t *testing.T) {
 	addr := ln.Addr().String()
 
 	srv := NewServer(addr, users, signer)
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			srv.mu.RLock()
-			u, ok := srv.Users[c.User()]
-			srv.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"jailRoot": u.Root,
-					"user":     c.User(),
-					"canRead":  fmt.Sprintf("%v", u.CanRead),
-					"canWrite": fmt.Sprintf("%v", u.CanWrite),
-				},
-			}, nil
-		},
-	}
-	cfg.AddHostKey(srv.Signer)
+	cfg := srv.sshServerConfig()
 
 	go func() {
 		for {
@@ -711,5 +671,326 @@ func TestSFTPServer_UploadFilePermissions(t *testing.T) {
 	// Mask to the permission bits only and verify owner-only access (0600).
 	if got := info.Mode().Perm(); got != 0600 {
 		t.Errorf("file permissions = %04o; want 0600", got)
+	}
+}
+
+// testClientKey generates a throwaway RSA key pair for use as a client
+// authentication key in tests.  It returns both the signer (private key) and
+// the corresponding public key.
+func testClientKey(t *testing.T) (ssh.Signer, ssh.PublicKey) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer, signer.PublicKey()
+}
+
+// dialSFTPWithPublicKey connects an sftp.Client to addr using public-key auth.
+func dialSFTPWithPublicKey(t *testing.T, addr, user string, signer ssh.Signer) *sftp.Client {
+	t.Helper()
+	sshCfg := &ssh.ClientConfig{
+		User:            user,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	client, err := sftp.NewClient(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("sftp.NewClient: %v", err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		conn.Close()
+	})
+	return client
+}
+
+// TestSFTPServer_PublicKeyAuth verifies that a user configured with an
+// AuthorizedKeys entry can authenticate using the matching private key and
+// perform full read/write SFTP operations.
+func TestSFTPServer_PublicKeyAuth(t *testing.T) {
+	root := t.TempDir()
+	clientSigner, clientPubKey := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"keyuser": {
+			AuthorizedKeys: []ssh.PublicKey{clientPubKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTPWithPublicKey(t, addr, "keyuser", clientSigner)
+
+	// Upload a file to verify write access.
+	content := []byte("public key auth test")
+	f, err := client.Create("/pubkey.txt")
+	if err != nil {
+		t.Fatalf("client.Create: %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("f.Write: %v", err)
+	}
+	f.Close()
+
+	// Download and verify the content.
+	rf, err := client.Open("/pubkey.txt")
+	if err != nil {
+		t.Fatalf("client.Open: %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	rf.Close()
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+}
+
+// TestSFTPServer_PublicKeyAuth_InvalidKey verifies that a key not listed in a
+// user's AuthorizedKeys is rejected.
+func TestSFTPServer_PublicKeyAuth_InvalidKey(t *testing.T) {
+	root := t.TempDir()
+	_, authorizedKey := testClientKey(t)
+	wrongSigner, _ := testClientKey(t)
+	users := map[string]UserInfo{
+		"keyuser": {
+			AuthorizedKeys: []ssh.PublicKey{authorizedKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	sshCfg := &ssh.ClientConfig{
+		User:            "keyuser",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(wrongSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected authentication error with wrong key, got nil")
+	}
+}
+
+// TestServer_AddUserKey verifies that AddUserKey grants a new key authentication
+// access for an existing user without disturbing the existing password or other
+// fields.
+func TestServer_AddUserKey(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"alice": {Password: "alicepw", Root: root, CanRead: true, CanWrite: true},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Before AddUserKey: public-key auth must fail (no keys registered).
+	newSigner, newPubKey := testClientKey(t)
+	sshCfg := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(newSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure before AddUserKey, got nil")
+	}
+
+	// AddUserKey: public-key auth must now succeed.
+	srv.AddUserKey("alice", newPubKey)
+	_ = dialSFTPWithPublicKey(t, addr, "alice", newSigner)
+
+	// Password auth must still work.
+	_ = dialSFTP(t, addr, "alice", "alicepw")
+}
+
+// TestServer_RemoveUserKey verifies that RemoveUserKey revokes a specific key
+// while leaving any other keys (and password auth) intact.
+func TestServer_RemoveUserKey(t *testing.T) {
+	root := t.TempDir()
+	signer1, pubKey1 := testClientKey(t)
+	signer2, pubKey2 := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"bob": {
+			Password:       "bobpw",
+			AuthorizedKeys: []ssh.PublicKey{pubKey1, pubKey2},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	srv, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Both keys work initially.
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer1)
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer2)
+
+	// Remove key1 only.
+	srv.RemoveUserKey("bob", pubKey1)
+
+	// key1 must now be rejected.
+	sshCfg := &ssh.ClientConfig{
+		User:            "bob",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer1)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+	if _, err := ssh.Dial("tcp", addr, sshCfg); err == nil {
+		t.Fatal("expected auth failure for removed key, got nil")
+	}
+
+	// key2 must still work.
+	_ = dialSFTPWithPublicKey(t, addr, "bob", signer2)
+
+	// Password auth must still work.
+	_ = dialSFTP(t, addr, "bob", "bobpw")
+}
+
+// TestServer_AddUserKey_NoDuplicate verifies that AddUserKey does not store the
+// same key more than once when called multiple times with identical keys.
+func TestServer_AddUserKey_NoDuplicate(t *testing.T) {
+	root := t.TempDir()
+	_, pubKey := testClientKey(t)
+
+	srv := NewServer(":0", map[string]UserInfo{
+		"carol": {Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.AddUserKey("carol", pubKey)
+	srv.AddUserKey("carol", pubKey)
+	srv.AddUserKey("carol", pubKey)
+
+	srv.mu.RLock()
+	n := len(srv.Users["carol"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("expected 1 authorized key after duplicate adds, got %d", n)
+	}
+}
+
+// TestServer_AddRemoveUserKey_NonExistentUser verifies that calling AddUserKey
+// or RemoveUserKey for a user that does not exist is a safe no-op.
+func TestServer_AddRemoveUserKey_NonExistentUser(t *testing.T) {
+	srv := NewServer(":0", map[string]UserInfo{}, testSigner(t))
+	_, pub := testClientKey(t)
+
+	// Neither call should panic or create phantom entries.
+	srv.AddUserKey("ghost", pub)
+	srv.RemoveUserKey("ghost", pub)
+
+	srv.mu.RLock()
+	_, exists := srv.Users["ghost"]
+	srv.mu.RUnlock()
+
+	if exists {
+		t.Error("AddUserKey created a user entry for a non-existent user")
+	}
+}
+
+// TestServer_NilKeyInAuthorizedKeys verifies that the server does not panic
+// when AuthorizedKeys contains a nil entry. The nil entry must be skipped, and
+// a subsequent valid key in the same slice must still be accepted.
+func TestServer_NilKeyInAuthorizedKeys(t *testing.T) {
+	root := t.TempDir()
+	validSigner, validPubKey := testClientKey(t)
+
+	users := map[string]UserInfo{
+		"dave": {
+			// AuthorizedKeys intentionally contains a nil entry before the
+			// valid key to trigger the panic-prone code path.
+			AuthorizedKeys: []ssh.PublicKey{nil, validPubKey},
+			Root:           root,
+			CanRead:        true,
+			CanWrite:       true,
+		},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	// Must not panic; valid key after the nil entry must authenticate.
+	client := dialSFTPWithPublicKey(t, addr, "dave", validSigner)
+	_ = client
+}
+
+// TestServer_AddUserKey_NilKey verifies that passing nil to AddUserKey is a
+// safe no-op and does not panic or corrupt the AuthorizedKeys slice.
+func TestServer_AddUserKey_NilKey(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"eve": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.AddUserKey("eve", nil) // must not panic
+
+	srv.mu.RLock()
+	n := len(srv.Users["eve"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("AddUserKey(nil) changed AuthorizedKeys length to %d; want 1", n)
+	}
+}
+
+// TestServer_RemoveUserKey_NilEntry verifies that RemoveUserKey does not panic
+// when AuthorizedKeys contains nil entries and correctly removes the target key.
+func TestServer_RemoveUserKey_NilEntry(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"frank": {
+			// Mix nil entries with a real key.
+			AuthorizedKeys: []ssh.PublicKey{nil, pub, nil},
+			Root:           root,
+			CanRead:        true,
+		},
+	}, testSigner(t))
+
+	srv.RemoveUserKey("frank", pub) // must not panic
+
+	srv.mu.RLock()
+	keys := srv.Users["frank"].AuthorizedKeys
+	srv.mu.RUnlock()
+
+	for _, k := range keys {
+		if k == nil {
+			continue
+		}
+		t.Error("RemoveUserKey left the real key in AuthorizedKeys")
+	}
+}
+
+// TestServer_RemoveUserKey_NilKey verifies that passing nil to RemoveUserKey is
+// a safe no-op and does not modify AuthorizedKeys.
+func TestServer_RemoveUserKey_NilKey(t *testing.T) {
+	root := t.TempDir()
+	_, pub := testClientKey(t)
+	srv := NewServer(":0", map[string]UserInfo{
+		"grace": {AuthorizedKeys: []ssh.PublicKey{pub}, Root: root, CanRead: true},
+	}, testSigner(t))
+
+	srv.RemoveUserKey("grace", nil) // must not panic
+
+	srv.mu.RLock()
+	n := len(srv.Users["grace"].AuthorizedKeys)
+	srv.mu.RUnlock()
+
+	if n != 1 {
+		t.Errorf("RemoveUserKey(nil) changed AuthorizedKeys length to %d; want 1", n)
 	}
 }

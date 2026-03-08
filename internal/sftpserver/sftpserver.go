@@ -32,10 +32,11 @@ func NewSignerFromFile(path string) (ssh.Signer, error) {
 
 // UserInfo holds the credentials and jail root for a single SFTP user.
 type UserInfo struct {
-	Password string
-	Root     string // jail root on disk, e.g. /srv/sftp/alice
-	CanRead  bool   // allow read/download/list operations
-	CanWrite bool   // allow write/upload/delete/rename operations
+	Password       string
+	AuthorizedKeys []ssh.PublicKey // public keys allowed for authentication; nil or empty means public-key auth is disabled for this user
+	Root           string          // jail root on disk, e.g. /srv/sftp/alice
+	CanRead        bool            // allow read/download/list operations
+	CanWrite       bool            // allow write/upload/delete/rename operations
 }
 
 // Server is a self-contained SFTP server.
@@ -75,6 +76,60 @@ func (s *Server) RemoveUser(username string) {
 	delete(s.Users, username)
 }
 
+// AddUserKey appends key to the AuthorizedKeys of an existing user.
+// If the key is already present (by wire-format equality) it is not added again.
+// It is a no-op when username does not exist or key is nil.
+// It is safe to call concurrently with active connections.
+func (s *Server) AddUserKey(username string, key ssh.PublicKey) {
+	if key == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.Users[username]
+	if !ok {
+		return
+	}
+	keyBytes := key.Marshal()
+	for _, existing := range u.AuthorizedKeys {
+		if existing == nil {
+			continue
+		}
+		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) == 1 {
+			return // already present
+		}
+	}
+	u.AuthorizedKeys = append(u.AuthorizedKeys, key)
+	s.Users[username] = u
+}
+
+// RemoveUserKey removes key from the AuthorizedKeys of an existing user.
+// It is a no-op when username does not exist, the key is not found, or key is nil.
+// It is safe to call concurrently with active connections.
+func (s *Server) RemoveUserKey(username string, key ssh.PublicKey) {
+	if key == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.Users[username]
+	if !ok {
+		return
+	}
+	keyBytes := key.Marshal()
+	var filtered []ssh.PublicKey
+	for _, existing := range u.AuthorizedKeys {
+		if existing == nil {
+			continue
+		}
+		if subtle.ConstantTimeCompare(keyBytes, existing.Marshal()) != 1 {
+			filtered = append(filtered, existing)
+		}
+	}
+	u.AuthorizedKeys = filtered
+	s.Users[username] = u
+}
+
 // NewServer creates a new Server with the given address, user map, and host key.
 func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Server {
 	return &Server{
@@ -88,25 +143,7 @@ func NewServer(addr string, users map[string]UserInfo, signer ssh.Signer) *Serve
 // ListenAndServe starts the SFTP server and blocks, accepting connections.
 // It returns a non-nil error only if the listener cannot be created.
 func (s *Server) ListenAndServe() error {
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			s.mu.RLock()
-			u, ok := s.Users[c.User()]
-			s.mu.RUnlock()
-			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
-				return nil, fmt.Errorf("invalid credentials")
-			}
-			return &ssh.Permissions{
-				Extensions: map[string]string{
-					"jailRoot": u.Root,
-					"user":     c.User(),
-					"canRead":  fmt.Sprintf("%v", u.CanRead),
-					"canWrite": fmt.Sprintf("%v", u.CanWrite),
-				},
-			}, nil
-		},
-	}
-	cfg.AddHostKey(s.Signer)
+	cfg := s.sshServerConfig()
 
 	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
@@ -122,6 +159,63 @@ func (s *Server) ListenAndServe() error {
 		}
 		go handleConn(nc, cfg, s.CompletedUploads)
 	}
+}
+
+// permissionsFor builds the ssh.Permissions for an authenticated user,
+// embedding the jail root and access flags as extensions so that the
+// connection handler can retrieve them after the handshake.
+func permissionsFor(u UserInfo, username string) *ssh.Permissions {
+	return &ssh.Permissions{
+		Extensions: map[string]string{
+			"jailRoot": u.Root,
+			"user":     username,
+			"canRead":  fmt.Sprintf("%v", u.CanRead),
+			"canWrite": fmt.Sprintf("%v", u.CanWrite),
+		},
+	}
+}
+
+// sshServerConfig builds the SSH server configuration with both password-based
+// and public-key-based authentication enabled.
+//
+// Password authentication succeeds when the supplied password matches the
+// stored Password (constant-time comparison).
+//
+// Public-key authentication succeeds when the presented key matches any entry
+// in the user's AuthorizedKeys slice (constant-time comparison of wire-format
+// bytes).
+func (s *Server) sshServerConfig() *ssh.ServerConfig {
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			s.mu.RLock()
+			u, ok := s.Users[c.User()]
+			s.mu.RUnlock()
+			if !ok || subtle.ConstantTimeCompare([]byte(u.Password), pass) != 1 {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			return permissionsFor(u, c.User()), nil
+		},
+		PublicKeyCallback: func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			s.mu.RLock()
+			u, ok := s.Users[c.User()]
+			s.mu.RUnlock()
+			if !ok {
+				return nil, fmt.Errorf("invalid credentials")
+			}
+			keyBytes := key.Marshal()
+			for _, authorizedKey := range u.AuthorizedKeys {
+				if authorizedKey == nil {
+					continue
+				}
+				if subtle.ConstantTimeCompare(keyBytes, authorizedKey.Marshal()) == 1 {
+					return permissionsFor(u, c.User()), nil
+				}
+			}
+			return nil, fmt.Errorf("invalid credentials")
+		},
+	}
+	cfg.AddHostKey(s.Signer)
+	return cfg
 }
 
 func handleConn(nc net.Conn, cfg *ssh.ServerConfig, uploads chan<- string) {
