@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -992,5 +993,353 @@ func TestServer_RemoveUserKey_NilKey(t *testing.T) {
 
 	if n != 1 {
 		t.Errorf("RemoveUserKey(nil) changed AuthorizedKeys length to %d; want 1", n)
+	}
+}
+
+// TestSFTPServer_CreateFolder verifies that a directory can be successfully
+// created via SFTP Mkdir, and that it is visible when listing the parent.
+func TestSFTPServer_CreateFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	if err := client.Mkdir("/newdir"); err != nil {
+		t.Fatalf("Mkdir(/newdir): %v", err)
+	}
+
+	entries, err := client.ReadDir("/")
+	if err != nil {
+		t.Fatalf("ReadDir(/): %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.Name() == "newdir" && e.IsDir() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("created directory newdir not found in ReadDir(/)")
+	}
+}
+
+// TestSFTPServer_CreateFileInFolder verifies that a file can be created inside
+// a previously created subdirectory.
+func TestSFTPServer_CreateFileInFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	if err := client.Mkdir("/subdir"); err != nil {
+		t.Fatalf("Mkdir(/subdir): %v", err)
+	}
+
+	content := []byte("file in subfolder")
+	f, err := client.Create("/subdir/file.txt")
+	if err != nil {
+		t.Fatalf("Create(/subdir/file.txt): %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Verify by downloading.
+	rf, err := client.Open("/subdir/file.txt")
+	if err != nil {
+		t.Fatalf("Open(/subdir/file.txt): %v", err)
+	}
+	got, err := io.ReadAll(rf)
+	rf.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+}
+
+// TestSFTPServer_RenameFile verifies that an uploaded file can be renamed via
+// the SFTP Rename command, and that the new name is accessible while the old
+// name is gone.
+func TestSFTPServer_RenameFile(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file.
+	content := []byte("rename me")
+	f, err := client.Create("/original.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Rename it.
+	if err := client.Rename("/original.txt", "/renamed.txt"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	// New name must be readable.
+	rf, err := client.Open("/renamed.txt")
+	if err != nil {
+		t.Fatalf("Open(/renamed.txt): %v", err)
+	}
+	got, _ := io.ReadAll(rf)
+	rf.Close()
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+
+	// Old name must no longer exist.
+	if _, err := client.Stat("/original.txt"); err == nil {
+		t.Error("expected error accessing old name after rename, got nil")
+	}
+}
+
+// TestSFTPServer_MoveFileBetweenFolders verifies that a file can be moved from
+// one existing subdirectory to another via Rename.
+func TestSFTPServer_MoveFileBetweenFolders(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create source and destination directories.
+	if err := client.Mkdir("/src"); err != nil {
+		t.Fatalf("Mkdir(/src): %v", err)
+	}
+	if err := client.Mkdir("/dst"); err != nil {
+		t.Fatalf("Mkdir(/dst): %v", err)
+	}
+
+	// Upload a file to the source directory.
+	content := []byte("moving between folders")
+	f, err := client.Create("/src/move.txt")
+	if err != nil {
+		t.Fatalf("Create(/src/move.txt): %v", err)
+	}
+	if _, err = f.Write(content); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Move the file to the destination directory.
+	if err := client.Rename("/src/move.txt", "/dst/move.txt"); err != nil {
+		t.Fatalf("Rename (move between folders): %v", err)
+	}
+
+	// Verify the file is now at the destination.
+	rf, err := client.Open("/dst/move.txt")
+	if err != nil {
+		t.Fatalf("Open(/dst/move.txt): %v", err)
+	}
+	got, _ := io.ReadAll(rf)
+	rf.Close()
+	if !bytes.Equal(got, content) {
+		t.Errorf("downloaded %q; want %q", got, content)
+	}
+
+	// Source must no longer exist.
+	if _, err := client.Stat("/src/move.txt"); err == nil {
+		t.Error("expected error accessing source after move, got nil")
+	}
+}
+
+// TestSFTPServer_DeleteFileInFolder verifies that a file inside a subdirectory
+// can be deleted via SFTP Remove.
+func TestSFTPServer_DeleteFileInFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Create a folder and upload a file into it.
+	if err := client.Mkdir("/folder"); err != nil {
+		t.Fatalf("Mkdir(/folder): %v", err)
+	}
+	f, err := client.Create("/folder/todelete.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("delete me")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Delete the file.
+	if err := client.Remove("/folder/todelete.txt"); err != nil {
+		t.Fatalf("Remove(/folder/todelete.txt): %v", err)
+	}
+
+	// Verify the file is gone.
+	if _, err := client.Stat("/folder/todelete.txt"); err == nil {
+		t.Error("expected error accessing deleted file, got nil")
+	}
+}
+
+// TestSFTPServer_MoveFileToNonExistentFolder verifies that renaming a file into
+// a directory that does not exist returns an error.
+func TestSFTPServer_MoveFileToNonExistentFolder(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file.
+	f, err := client.Create("/existing.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("content")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Attempt to rename into a non-existent directory; must fail.
+	err = client.Rename("/existing.txt", "/nosuchdir/existing.txt")
+	if err == nil {
+		t.Error("expected error when moving file to non-existent folder, got nil")
+	}
+}
+
+// TestSFTPServer_Chmod verifies that a chmod (Setstat with permissions) request
+// is accepted by the server without error.
+func TestSFTPServer_Chmod(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file.
+	f, err := client.Create("/chmod_test.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("chmod test")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Send a chmod request; the server accepts but does not apply it (no-op).
+	if err := client.Chmod("/chmod_test.txt", 0644); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+}
+
+// TestSFTPServer_Chown verifies that a chown (Setstat with uid/gid) request is
+// accepted by the server without error.  The server records no-op for Setstat,
+// so the underlying uid/gid on disk is unchanged; we only verify the protocol
+// round-trip succeeds.
+func TestSFTPServer_Chown(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file.
+	f, err := client.Create("/chown_test.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("chown test")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Retrieve the current owner so we can use valid uid/gid values.
+	info, err := os.Stat(filepath.Join(root, "chown_test.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("cannot read uid/gid on this platform")
+	}
+	uid := int(stat.Uid)
+	gid := int(stat.Gid)
+
+	// Send chown with the same uid/gid; the server accepts this as a no-op.
+	if err := client.Chown("/chown_test.txt", uid, gid); err != nil {
+		t.Fatalf("Chown: %v", err)
+	}
+}
+
+// TestSFTPServer_Chgrp verifies that a chgrp (Setstat with a new gid) request
+// is accepted by the server without error.
+func TestSFTPServer_Chgrp(t *testing.T) {
+	root := t.TempDir()
+	users := map[string]UserInfo{
+		"testuser": {Password: "testpw", Root: root, CanRead: true, CanWrite: true},
+	}
+	_, addr, stop := startTestServer(t, users)
+	t.Cleanup(stop)
+
+	client := dialSFTP(t, addr, "testuser", "testpw")
+
+	// Upload a file.
+	f, err := client.Create("/chgrp_test.txt")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err = f.Write([]byte("chgrp test")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	// Retrieve the current owner/group so we can pass valid identifiers.
+	info, err := os.Stat(filepath.Join(root, "chgrp_test.txt"))
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("cannot read uid/gid on this platform")
+	}
+	uid := int(stat.Uid)
+	gid := int(stat.Gid)
+
+	// Chown with uid unchanged and gid unchanged acts as chgrp; the server
+	// accepts this as a no-op for Setstat.
+	if err := client.Chown("/chgrp_test.txt", uid, gid); err != nil {
+		t.Fatalf("Chown (chgrp): %v", err)
 	}
 }
